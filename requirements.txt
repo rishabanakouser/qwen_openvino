@@ -1,0 +1,45 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Core framework
+# ──────────────────────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9        # required for multipart/form-data in FastAPI
+python-dotenv>=1.0.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenVINO + Optimum Intel (for Qwen2.5-VL)
+# ──────────────────────────────────────────────────────────────────────────────
+openvino>=2024.3.0
+# NOTE: optimum-intel 1.27.0 + transformers 4.46.3 is the pinned working combo.
+# - optimum-intel >= 2.x requires transformers >= 4.51 which imports sklearn → scipy
+#   which triggers Windows AppControl DLL blocks on some machines.
+# - scikit-learn / scipy are NOT needed at inference time.
+optimum-intel==1.27.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Transformers / model utilities
+# ──────────────────────────────────────────────────────────────────────────────
+transformers==4.46.3
+tokenizers>=0.20.0
+accelerate>=0.33.0
+
+# Qwen2.5-VL vision utilities (official helper package)
+qwen-vl-utils>=0.0.8
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Image processing
+# ──────────────────────────────────────────────────────────────────────────────
+Pillow>=10.0.0
+opencv-python-headless>=4.9.0  # headless: no GUI dependencies needed on servers
+numpy>=1.24.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Translation
+# ──────────────────────────────────────────────────────────────────────────────
+deep-translator>=1.11.4
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional: GPU/NPU inference acceleration (install separately if needed)
+# ──────────────────────────────────────────────────────────────────────────────
+# openvino-gpu          # uncomment if GPU plugin is not bundled with openvino
+# nncf>=2.11.0          # uncomment for INT8 quantization (model conversion only)
