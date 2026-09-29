@@ -24,18 +24,19 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Prompt
-# ──────────────────────────────────────────────────────────────────────────────
 def get_ocr_prompt(source_language: str, target_language: str) -> str:
     return (
         f"Detect every visible text region in the image (assuming it is mostly {source_language}) "
         f"and translate the text into {target_language}. "
-        "Do not summarize the image. "
-        "Do not describe the image. "
-        "Do not omit small text. "
-        "Do not omit headings, labels, buttons, menus, captions, or text near the edges. "
-        "Return every detected text region with its exact pixel bounding box. "
+        "Rules: "
+        "1. One entry per visual line or UI element — NEVER split a single line/word into fragments. "
+        "2. Merge fragments belonging to the same line into one entry. "
+        "3. Tight pixel bounding box [x1, y1, x2, y2] hugging the exact glyphs, "
+        "in ORIGINAL image pixel coordinates (not 0-1000 normalized). "
+        "4. Reading order top-to-bottom, left-to-right. "
+        "5. Exact original text + natural translation (keep code/commands like "
+        "'netstat -ano | findstr :8000' untranslated if a translation makes no sense). "
+        "Do not summarize or describe the image. Do not omit small text. "
         "Return ONLY a JSON array. No explanation. No markdown. "
         "Use this exact format:\n"
         '[{"text": "...", "translated_text": "...", "bbox": [x1, y1, x2, y2]}, ...]'
@@ -98,7 +99,7 @@ class OCRService:
         img_tensor = ov.Tensor(np.array(image))
 
         config = openvino_genai.GenerationConfig()
-        config.max_new_tokens = 4096
+        config.max_new_tokens = 2048
         config.do_sample = False
 
         prompt = get_ocr_prompt(source_language, target_language)
@@ -159,6 +160,67 @@ class OCRService:
     # ─────────────────────────────────────────────────────────────────────────
     # Validation
     # ─────────────────────────────────────────────────────────────────────────
+    MIN_BOX_W = 8
+    MIN_BOX_H = 8
+    NMS_IOU_THRESHOLD = 0.3
+
+    @staticmethod
+    def _iou(a: list[int], b: list[int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter == 0:
+            return 0.0
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    @classmethod
+    def _filter_and_merge(cls, detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop tiny boxes, merge overlapping fragments (e.g. 'Ici:' + 'ere:').
+
+        Sorts by area (largest first), greedily unions boxes with IoU >
+        NMS_IOU_THRESHOLD. Merged text is concatenated with a space so split
+        words reassemble instead of double-drawing on top of each other.
+        """
+        # 2. Filter tiny noise boxes (UI speckles, icons)
+        kept = []
+        for det in detections:
+            x1, y1, x2, y2 = det["bbox"]
+            if (x2 - x1) < cls.MIN_BOX_W or (y2 - y1) < cls.MIN_BOX_H:
+                logger.warning("OCR | dropping tiny box %s text='%.30s'", det["bbox"], det["text"])
+                continue
+            kept.append(det)
+        # Sort largest-first so fragments merge INTO the dominant box
+        kept.sort(key=lambda d: (d["bbox"][2] - d["bbox"][0]) * (d["bbox"][3] - d["bbox"][1]), reverse=True)
+        merged: list[dict[str, Any]] = []
+        for det in kept:
+            placed = False
+            for m in merged:
+                if cls._iou(det["bbox"], m["bbox"]) > cls.NMS_IOU_THRESHOLD:
+                    # Union bbox
+                    mx1, my1, mx2, my2 = m["bbox"]
+                    x1, y1, x2, y2 = det["bbox"]
+                    m["bbox"] = [min(mx1, x1), min(my1, y1), max(mx2, x2), max(my2, y2)]
+                    # Concatenate split fragments (avoid exact duplicates)
+                    if det["text"] not in m["text"]:
+                        m["text"] = (m["text"] + " " + det["text"]).strip()
+                    if det.get("translated_text") and det["translated_text"] not in (m.get("translated_text") or ""):
+                        m["translated_text"] = ((m.get("translated_text") or "") + " " + det["translated_text"]).strip()
+                    placed = True
+                    break
+            if not placed:
+                merged.append(det)
+        # Reading order: top-to-bottom, then left-to-right (stable render)
+        merged.sort(key=lambda d: (d["bbox"][1] // 10, d["bbox"][0]))
+        if len(merged) != len(detections):
+            logger.info("OCR | NMS: %d -> %d boxes (tiny/overlap removed)", len(detections), len(merged))
+        return merged
+
     @staticmethod
     def _validate_detections(
         detections: list[dict[str, Any]],
@@ -206,15 +268,44 @@ class OCRService:
                 if not isinstance(translated_text, str):
                     translated_text = ""
 
+                # NOTE: font/background style is NO LONGER predicted by Qwen.
+                # It is filled in later by services/font_style_service.py
+                # (local OpenCV analysis, zero model cost). Keep keys present
+                # with None defaults so downstream code has a stable schema.
+                # Backward-compat: if an old model output still contains style
+                # fields, preserve them; otherwise leave None for enrichment.
+                def _get_rgb_optional(key):
+                    val = det.get(key)
+                    if isinstance(val, list) and len(val) == 3:
+                        try:
+                            return tuple(int(v) for v in val)
+                        except (ValueError, TypeError):
+                            pass
+                    return None
+
+                _font_rgb = _get_rgb_optional("font_color_rgb")
+                _bg_rgb = _get_rgb_optional("background_color_rgb")
+                _fsize = det.get("font_size")
+                if not isinstance(_fsize, (int, float)):
+                    _fsize = None
+
                 valid.append(
                     {
                         "text": text.strip(),
                         "translated_text": translated_text.strip(),
                         "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                        "font_color_rgb": _font_rgb,
+                        "font_color_hex": det.get("font_color_hex"),
+                        "font_size": int(_fsize) if _fsize else None,
+                        "font_weight": det.get("font_weight", None),
+                        "font_style": det.get("font_style", None),
+                        "font_family": det.get("font_family", None),
+                        "background_color_rgb": _bg_rgb,
+                        "background_color_hex": det.get("background_color_hex"),
                     }
                 )
 
             except Exception as exc:
                 logger.warning("OCR | skipping detection #%d — %s | raw=%s", idx, exc, det)
 
-        return valid
+        return OCRService._filter_and_merge(valid)

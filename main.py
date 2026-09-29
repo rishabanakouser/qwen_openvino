@@ -3,7 +3,7 @@ main.py - FastAPI application for OCR + Translation using Qwen2.5-VL OpenVINO.
 
 Architecture:
   startup  → load OpenVINO model once
-  POST /translate → OCRService → TranslationService → InpaintService → TextRenderer
+  
   GET  /outputs/{filename} → serve translated image
   GET  /health  → liveness check
   GET  /info    → detailed runtime info
@@ -21,12 +21,12 @@ from typing import Any
 import openvino as ov
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 
 import config
 from services.ocr_service import OCRService
-from services.translation_service import TranslationService
+from services.font_style_service import FontStyleService
 from services.inpaint_service import InpaintService
 from services.text_renderer import TextRenderer
 
@@ -45,7 +45,7 @@ logger = logging.getLogger("main")
 # ──────────────────────────────────────────────────────────────────────────────
 app_state: dict[str, Any] = {
     "ocr_service": None,
-    "translation_service": None,
+    "font_style_service": None,
     "inpaint_service": None,
     "text_renderer": None,
     "device": config.OPENVINO_DEVICE,
@@ -101,7 +101,7 @@ async def lifespan(app: FastAPI):
 
     # ── Initialise services ───────────────────────────────────────────────
     app_state["ocr_service"] = OCRService(pipe=pipe)
-    app_state["translation_service"] = TranslationService()
+    app_state["font_style_service"] = FontStyleService()
     app_state["inpaint_service"] = InpaintService()
     app_state["text_renderer"] = TextRenderer()
 
@@ -149,7 +149,7 @@ async def translate(
     Full pipeline:
       1. Read uploaded image
       2. OCR with Qwen2.5-VL → list of {text, bbox}
-      3. Translate each text with TranslationService
+      3. Translate each text
       4. Inpaint original text regions
       5. Render translated text inside original bboxes
       6. Save output image
@@ -180,7 +180,7 @@ async def translate(
         raise HTTPException(status_code=422, detail="Uploaded image is empty")
 
     try:
-        pil_image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        pil_image = ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes))).convert("RGB")
     except Exception as exc:
         raise HTTPException(
             status_code=422, detail=f"Cannot open image: {exc}"
@@ -210,6 +210,17 @@ async def translate(
     
     translation_time = 0.0 # Bypassed because it's bundled in OCR
 
+    # ── 3. Local font-style analysis (no model, OpenCV only) ─────────────
+    print("\nDEBUG: [STEP 2b] Estimating font color/size locally (no model)...")
+    style_start = time.perf_counter()
+    try:
+        style_svc: FontStyleService = app_state["font_style_service"]
+        detections = style_svc.enrich(pil_image, detections)
+    except Exception as exc:
+        logger.exception("Font-style analysis failed: %s", exc)
+    style_time = time.perf_counter() - style_start
+    logger.info("Font-style analysis time: %.3fs", style_time)
+
     # ── 4. Inpainting ─────────────────────────────────────────────────────
     print("\nDEBUG: [STEP 3] Starting Image Inpainting (removing original text)...")
     inpaint_start = time.perf_counter()
@@ -237,6 +248,18 @@ async def translate(
         ) from exc
     render_time = time.perf_counter() - render_start
     logger.info("Rendering time: %.2fs", render_time)
+
+    # ── 5b. Enforce output dimensions == input dimensions ────────────────
+    # Inpaint (numpy/cv2 round-trip) and renderer (.copy()+draw) preserve
+    # size, but guard against any accidental resize so output pixels match input.
+    if final_image.size != (orig_w, orig_h):
+        logger.warning(
+            "Dimension mismatch: input=%dx%d output=%dx%d — resizing back to input size",
+            orig_w, orig_h, final_image.size[0], final_image.size[1],
+        )
+        final_image = final_image.resize((orig_w, orig_h), Image.LANCZOS)
+    logger.info("Output dimensions: %dx%d (input was %dx%d)",
+                final_image.size[0], final_image.size[1], orig_w, orig_h)
 
     # ── 6. Save output image ──────────────────────────────────────────────
     print("\nDEBUG: [STEP 5] Saving final output image...")

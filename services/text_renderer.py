@@ -63,39 +63,56 @@ class TextRenderer:
     def render_text_in_bbox(
         self,
         image: Image.Image,
-        translated_text: str,
-        bbox: list[int],
-        text_color: tuple[int, int, int] = (0, 0, 0),
+        det: dict,
     ) -> Image.Image:
         """
-        Draw *translated_text* centred inside *bbox* on *image*.
+        Draw translated text inside bbox on *image* using extracted font details.
 
         Args:
-            image:           PIL RGB image to draw on (modified in-place, copy returned).
-            translated_text: String to render.
-            bbox:            [x1, y1, x2, y2] in original image pixel coords.
-            text_color:      RGB tuple for the text colour.
+            image: PIL RGB image to draw on (modified in-place, copy returned).
+            det:   Detection dictionary with text, bbox, and font details.
 
         Returns:
             New PIL image with text rendered.
         """
         image = image.copy()
-
+        
+        translated_text = det.get("translated_text", "")
         if not translated_text.strip():
             return image
 
-        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = det["bbox"]
         box_w = x2 - x1
         box_h = y2 - y1
 
         if box_w <= 0 or box_h <= 0:
-            logger.warning("TextRenderer | degenerate bbox %s, skipping", bbox)
+            logger.warning("TextRenderer | degenerate bbox %s, skipping", det["bbox"])
             return image
 
         draw = ImageDraw.Draw(image)
 
-        # Find the best (font, wrapped_lines) pair that fits inside the box
-        font, lines = self._fit_text(translated_text, box_w, box_h)
+        # Extract font details (filled by FontStyleService; tolerate None)
+        est_size = det.get("font_size") or 24
+        try:
+            est_size = int(est_size)
+        except (ValueError, TypeError):
+            est_size = 24
+        est_size = max(self.font_size_min, min(self.font_size_max, est_size))
+        font_color = det.get("font_color_rgb") or (0, 0, 0)
+        font_weight = det.get("font_weight") or "normal"
+        font_style = det.get("font_style") or "normal"
+        font_family = det.get("font_family") or "sans-serif"
+
+        # 1. Auto-fit: allow 20% horizontal bleed for longer translations
+        # (e.g. EN->FR expands). Fit against expanded width, but draw
+        # centered on the ORIGINAL box so bleed is symmetric (~10% each side).
+        fit_w = max(8, int(box_w * 1.2))
+        fit_h = max(8, box_h)
+        font, lines = self._fit_text(
+            translated_text, fit_w, fit_h,
+            start_size=est_size,
+            family=font_family, weight=font_weight, style=font_style,
+        )
 
         # Compute total text block height
         line_height = self._line_height(font)
@@ -112,7 +129,7 @@ class TextRenderer:
                 (start_x, start_y + i * line_height),
                 line,
                 font=font,
-                fill=text_color,
+                fill=font_color,
             )
 
         return image
@@ -121,18 +138,13 @@ class TextRenderer:
         self,
         image: Image.Image,
         detections: list[dict],
-        text_color: tuple[int, int, int] = (0, 0, 0),
     ) -> Image.Image:
         """
         Render translated text for every detection on the image.
-
-        Each detection must have: {"bbox": [...], "translated_text": "..."}.
         """
         for det in detections:
             try:
-                translated = det.get("translated_text", "")
-                bbox = det["bbox"]
-                image = self.render_text_in_bbox(image, translated, bbox, text_color)
+                image = self.render_text_in_bbox(image, det)
             except Exception as exc:
                 logger.warning(
                     "TextRenderer | failed for det %s: %s", det, exc
@@ -142,7 +154,32 @@ class TextRenderer:
     # ─────────────────────────────────────────────────────────────────────────
     # Internal helpers
     # ─────────────────────────────────────────────────────────────────────────
-    def _load_font(self, size: int) -> ImageFont.FreeTypeFont:
+    def _load_font(self, size: int, family: str = "", weight: str = "", style: str = "") -> ImageFont.FreeTypeFont:
+        is_bold = "bold" in weight.lower()
+        is_italic = "italic" in style.lower()
+        
+        # Try common windows fonts
+        font_name = "arial"
+        if "times" in family.lower(): font_name = "times"
+        elif "courier" in family.lower(): font_name = "cour"
+        elif "segoe" in family.lower(): font_name = "segoeui"
+            
+        suffix = ""
+        if is_bold and is_italic:
+            suffix = "bi" if font_name in ["arial", "times"] else "z"
+        elif is_bold:
+            suffix = "bd" if font_name in ["arial", "times", "cour"] else "b"
+        elif is_italic:
+            suffix = "i"
+            
+        system_font_path = Path(f"C:/Windows/Fonts/{font_name}{suffix}.ttf")
+        
+        if system_font_path.exists():
+            try:
+                return ImageFont.truetype(str(system_font_path), size=size)
+            except Exception:
+                pass
+
         if self.font_path:
             try:
                 return ImageFont.truetype(self.font_path, size=size)
@@ -171,15 +208,42 @@ class TextRenderer:
             return 16  # safe fallback
 
     def _wrap_text(self, text: str, font, max_width: int) -> list[str]:
-        """Wrap *text* so each line fits within *max_width* pixels."""
+        """Wrap *text* so each line fits within *max_width* pixels.
+
+        Handles long unbroken tokens (code, URLs, commands) by hard-splitting
+        them character-wise so `netstat -ano | findstr :8000` never overflows.
+        """
         words = text.split()
         if not words:
             return [text]
 
+        # Pre-split any single word wider than max_width
+        split_words: list[str] = []
+        for word in words:
+            if self._text_width(font, word) <= max_width:
+                split_words.append(word)
+                continue
+            # Hard-break long token char by char
+            chunk = ""
+            for ch in word:
+                cand = chunk + ch
+                if self._text_width(font, cand) <= max_width and chunk:
+                    chunk = cand
+                else:
+                    if chunk:
+                        split_words.append(chunk)
+                    chunk = ch
+                    # Single char wider than box (tiny box) — keep it anyway
+                    if self._text_width(font, chunk) > max_width:
+                        split_words.append(chunk)
+                        chunk = ""
+            if chunk:
+                split_words.append(chunk)
+
         lines: list[str] = []
         current_line = ""
 
-        for word in words:
+        for word in split_words:
             candidate = (current_line + " " + word).strip() if current_line else word
             if self._text_width(font, candidate) <= max_width:
                 current_line = candidate
@@ -198,26 +262,43 @@ class TextRenderer:
         text: str,
         box_w: int,
         box_h: int,
+        start_size: int | None = None,
+        family: str = "",
+        weight: str = "",
+        style: str = "",
     ) -> tuple[ImageFont.FreeTypeFont, list[str]]:
         """
-        Binary-search for the largest font size where the wrapped text
+        Top-down search for the largest font size where the wrapped text
         block fits entirely inside (box_w × box_h).
 
-        Returns (font, list_of_lines).
-        """
-        best_font = self._load_font(self.font_size_min)
-        best_lines = [text]
+        Starts at min(start_size, FONT_SIZE_MAX) so we never upscale beyond
+        the locally-estimated size — only shrink to fit.
 
-        for size in range(self.font_size_max, self.font_size_min - 1, -1):
-            font = self._load_font(size)
+        Returns (font, list_of_lines). Falls back to smallest size.
+        """
+        top = self.font_size_max
+        if start_size is not None:
+            try:
+                top = min(int(start_size), self.font_size_max)
+            except (ValueError, TypeError):
+                pass
+        top = max(top, self.font_size_min)
+
+        best_font = self._load_font(self.font_size_min, family, weight, style)
+        best_lines = self._wrap_text(text, best_font, box_w)
+
+        for size in range(top, self.font_size_min - 1, -1):
+            font = self._load_font(size, family, weight, style)
             lines = self._wrap_text(text, font, box_w)
+            if not lines:
+                continue
             line_h = self._line_height(font)
             total_h = line_h * len(lines)
             max_line_w = max(self._text_width(font, ln) for ln in lines)
 
             if max_line_w <= box_w and total_h <= box_h:
-                best_font = font
-                best_lines = lines
-                break  # largest fitting size found
+                return font, lines  # largest fitting size found
+            # Remember smallest as fallback
+            best_font, best_lines = font, lines
 
         return best_font, best_lines

@@ -31,9 +31,13 @@ class InpaintService:
         self,
         inpaint_radius: int = config.INPAINT_RADIUS,
         bbox_padding: int = config.BBOX_PADDING,
+        flat_bg_std_threshold: float = 18.0,
     ):
         self.inpaint_radius = inpaint_radius
         self.bbox_padding = bbox_padding
+        # Solid-fill is only safe on flat backgrounds. Above this grayscale
+        # std the region is gradient/code-block/photo -> must use TELEA.
+        self.flat_bg_std_threshold = flat_bg_std_threshold
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -46,12 +50,11 @@ class InpaintService:
         """
         Remove text from *image* at every bbox listed in *detections*.
 
-        Args:
-            image:      PIL RGB image.
-            detections: List of {"text": ..., "bbox": [x1, y1, x2, y2]}.
-
-        Returns:
-            New PIL RGB image with text regions inpainted.
+        Strategy per box:
+          - Flat background (gray std < threshold) + known bg color
+            -> fast solid fill (clean, no blur).
+          - Otherwise (gradient, code-block, dark UI, photo)
+            -> TELEA inpaint with dilated mask (reconstructs texture).
         """
         if not detections:
             logger.info("Inpaint | no detections, returning original image")
@@ -59,48 +62,47 @@ class InpaintService:
 
         img_np = np.array(image.convert("RGB"))          # H×W×3 uint8
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape
 
-        # Build a single combined mask covering all text regions
-        mask = self._build_mask(img_bgr.shape[:2], detections)
-
-        # Inpaint
-        inpainted_bgr = cv2.inpaint(
-            img_bgr,
-            mask,
-            inpaintRadius=self.inpaint_radius,
-            flags=cv2.INPAINT_TELEA,
-        )
-
-        inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(inpainted_rgb)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Internal helpers
-    # ─────────────────────────────────────────────────────────────────────────
-    def _build_mask(
-        self,
-        shape: tuple[int, int],
-        detections: list[dict],
-    ) -> np.ndarray:
-        """
-        Create a uint8 binary mask (255 = inpaint, 0 = keep).
-
-        Each bbox is expanded by self.bbox_padding pixels on every side
-        and clipped to image boundaries.
-        """
-        h, w = shape
         mask = np.zeros((h, w), dtype=np.uint8)
         pad = self.bbox_padding
 
         for det in detections:
             try:
-                x1, y1, x2, y2 = det["bbox"]
-                x1 = max(0, x1 - pad)
-                y1 = max(0, y1 - pad)
-                x2 = min(w, x2 + pad)
-                y2 = min(h, y2 + pad)
-                mask[y1:y2, x1:x2] = 255
+                x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
+                bg_color = det.get("background_color_rgb")
+
+                # Clamp + padded region for variance test
+                px1, py1 = max(0, x1 - pad), max(0, y1 - pad)
+                px2, py2 = min(w, x2 + pad), min(h, y2 + pad)
+                if px2 <= px1 or py2 <= py1:
+                    continue
+                region_std = float(gray[py1:py2, px1:px2].std())
+                is_flat = region_std < self.flat_bg_std_threshold
+
+                # 3. Solid fill ONLY on flat + known color; else inpaint.
+                if bg_color and is_flat:
+                    bgr = (int(bg_color[2]), int(bg_color[1]), int(bg_color[0]))
+                    cv2.rectangle(img_bgr, (px1, py1), (px2, py2), bgr, -1)
+                else:
+                    mask[py1:py2, px1:px2] = 255
             except Exception as exc:
                 logger.warning("Inpaint | skipping bad bbox %s: %s", det.get("bbox"), exc)
 
-        return mask
+        # Dilate mask 3px so anti-aliased text edges don't leave halos
+        # (this was visible as ghost outlines on your dark screenshot).
+        if cv2.countNonZero(mask) > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            inpainted_bgr = cv2.inpaint(
+                img_bgr,
+                mask,
+                inpaintRadius=self.inpaint_radius,
+                flags=cv2.INPAINT_TELEA,
+            )
+        else:
+            inpainted_bgr = img_bgr
+
+        inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(inpainted_rgb)
