@@ -37,6 +37,11 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 # ─────────────────────────────────────────────
 OPENVINO_DEVICE: str = os.getenv("OPENVINO_DEVICE", "GPU")
 
+# Qwen bbox coordinate convention: "auto" | "normalized" | "pixels".
+# "auto" treats all-values-<=1000 responses as 0-1000 normalized and scales
+# to pixels; larger values pass through as pixels (legacy behaviour).
+OCR_COORD_MODE: str = os.getenv("OCR_COORD_MODE", "auto")
+
 # ─────────────────────────────────────────────
 # Inpainting
 # ─────────────────────────────────────────────

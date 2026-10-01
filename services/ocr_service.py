@@ -31,8 +31,9 @@ def get_ocr_prompt(source_language: str, target_language: str) -> str:
         "Rules: "
         "1. One entry per visual line or UI element — NEVER split a single line/word into fragments. "
         "2. Merge fragments belonging to the same line into one entry. "
-        "3. Tight pixel bounding box [x1, y1, x2, y2] hugging the exact glyphs, "
-        "in ORIGINAL image pixel coordinates (not 0-1000 normalized). "
+        "3. Bounding box as NORMALIZED 0-1000 coordinates [x1, y1, x2, y2] "
+        "(0,0 = top-left, 1000,1000 = bottom-right), hugging the exact glyphs. "
+        "Do NOT guess pixels — the image may be resized internally. "
         "4. Reading order top-to-bottom, left-to-right. "
         "5. Exact original text + natural translation (keep code/commands like "
         "'netstat -ano | findstr :8000' untranslated if a translation makes no sense). "
@@ -65,8 +66,11 @@ class OCRService:
 
         Returns:
             List of dicts: {"text": str, "bbox": [x1, y1, x2, y2]}
-            Coordinates are in original image pixel space.
+            Coordinates are in original image pixel space (normalized model
+            output is scaled here — see _validate_detections).
         """
+        import config as _config
+
         orig_w, orig_h = image.size
         logger.info("OCR | original size: %dx%d", orig_w, orig_h)
 
@@ -83,7 +87,10 @@ class OCRService:
         logger.debug("OCR | raw model response: %s", raw_response)
 
         detections = self._parse_response(raw_response)
-        detections = self._validate_detections(detections, orig_w, orig_h)
+        detections = self._validate_detections(
+            detections, orig_w, orig_h,
+            coord_mode=getattr(_config, "OCR_COORD_MODE", "auto"),
+        )
 
         logger.info("OCR | %d valid detections", len(detections))
         return detections
@@ -121,40 +128,102 @@ class OCRService:
     # Parsing
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
+    def _try_json_list(s: str) -> list[dict[str, Any]] | None:
+        """Return parsed list or None (never raises)."""
+        try:
+            data = json.loads(s)
+            return data if isinstance(data, list) else None
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
     def _parse_response(raw: str) -> list[dict[str, Any]]:
         """
         Extract a JSON array from the model's raw output.
-        Handles cases where the model wraps the JSON in markdown code fences
-        or adds leading/trailing text.
+
+        Stages (first hit wins):
+          1. Direct parse.
+          2. Strip markdown fences and retry.
+          3. First '[' … last ']' slice (drops leading/trailing prose even
+             when the prose itself contains brackets — the old greedy regex
+             over-matched and died on exactly that).
+          4. Common repairs: trailing commas, raw control chars (strict=False).
+          5. Per-object fallback: parse each {...} individually so ONE corrupt
+             entry can't nuke 26 good detections (this incident).
+
+        Every failure logs msg + position + snippet instead of swallowing it.
         """
-        # 1. Try direct parse
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                return data
-        except json.JSONDecodeError:
-            pass
+        # 1. Direct parse
+        hit = OCRService._try_json_list(raw)
+        if hit is not None:
+            return hit
 
-        # 2. Strip markdown fences and retry
-        stripped = re.sub(r"```(?:json)?", "", raw).strip()
-        try:
-            data = json.loads(stripped)
-            if isinstance(data, list):
-                return data
-        except json.JSONDecodeError:
-            pass
+        # 2. Strip markdown fences (```json ... ```) and retry
+        stripped = re.sub(r"```(?:json)?", "", raw).strip().strip("`").strip()
+        if stripped != raw:
+            hit = OCRService._try_json_list(stripped)
+            if hit is not None:
+                return hit
 
-        # 3. Find the first [...] block
-        match = re.search(r"\[.*\]", raw, re.DOTALL)
-        if match:
+        # 3. First '[' … last ']' slice
+        start, end = raw.find("["), raw.rfind("]")
+        block = raw[start:end + 1] if 0 <= start < end else ""
+        if block and block != raw.strip():
+            hit = OCRService._try_json_list(block)
+            if hit is not None:
+                logger.info("OCR | recovered JSON via bracket slice (%d chars)", len(block))
+                return hit
+        elif block:
+            pass  # block == raw, already tried; fall through to repairs
+        else:
+            logger.warning("OCR | no [...] block found; raw len=%d head=%.200r", len(raw), raw[:200])
+
+        # 4. Repairs on the block (or raw if no brackets)
+        candidate = block or raw
+        # 4a. Trailing commas: {"a":1,} / [1,2,]
+        repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        if repaired != candidate:
+            hit = OCRService._try_json_list(repaired)
+            if hit is not None:
+                logger.info("OCR | recovered JSON after trailing-comma repair")
+                return hit
+        # 4b. Raw control chars (literal newlines/tabs inside strings)
+        try:
+            data = json.loads(candidate, strict=False)
+            if isinstance(data, list):
+                logger.info("OCR | recovered JSON with strict=False")
+                return data
+        except json.JSONDecodeError as exc:
+            logger.warning("OCR | strict=False also failed: %s at %d snippet=%.120r",
+                           exc.msg, exc.pos, candidate[max(0, exc.pos - 60):exc.pos + 60])
+
+        # 5. Per-object fallback — salvage every parseable {...}
+        salvaged: list[dict[str, Any]] = []
+        for m in re.finditer(r"\{[^{}]*\}", candidate):
+            obj_str = m.group()
+            obj = None
             try:
-                data = json.loads(match.group())
-                if isinstance(data, list):
-                    return data
+                obj = json.loads(obj_str)
             except json.JSONDecodeError:
-                pass
+                try:
+                    import ast
+                    obj = ast.literal_eval(obj_str)  # tolerates single quotes
+                except (ValueError, SyntaxError):
+                    continue
+            if isinstance(obj, dict) and obj.get("text") and obj.get("bbox"):
+                salvaged.append(obj)
+        if salvaged:
+            logger.warning("OCR | salvaged %d/%d objects individually (full-array parse failed)",
+                           len(salvaged), candidate.count('"text"'))
+            return salvaged
 
-        logger.warning("OCR | could not parse model response as JSON; returning []")
+        try:
+            json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            logger.warning("OCR | could not parse model response: %s at char %d of %d; head=%.200r tail=%.200r",
+                           exc.msg, exc.pos, len(candidate), candidate[:200], candidate[-200:])
+        else:
+            logger.warning("OCR | response parsed but was not a list; head=%.200r", candidate[:200])
         return []
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -226,16 +295,34 @@ class OCRService:
         detections: list[dict[str, Any]],
         img_w: int,
         img_h: int,
+        coord_mode: str = "auto",
     ) -> list[dict[str, Any]]:
         """
         Validate each detection:
           - text must be a non-empty string
           - bbox must have exactly 4 numeric values
           - x1 < x2, y1 < y2
-          - coordinates are clipped to image boundaries
+          - coordinates are scaled (if 0-1000 normalized) then clipped to image
+
+        Coordinate handling: Qwen's vision preprocessor smart-resizes the
+        image internally, so asked-for "original pixels" come back in an
+        unknown resized space (boxes land small/shifted). The prompt now asks
+        for 0-1000 normalized coords, scaled here deterministically.
+          - "normalized": always scale x*W/1000, y*H/1000
+          - "pixels": use as-is (legacy)
+          - "auto": normalized iff EVERY bbox value in the response is <=1000
 
         Invalid detections are skipped (logged as warnings) without crashing.
         """
+        mode = (coord_mode or "auto").lower()
+        if mode == "auto":
+            try:
+                all_vals = [float(v) for det in detections
+                            for v in (det.get("bbox") or [])]
+                mode = "normalized" if all_vals and max(all_vals) <= 1000 else "pixels"
+            except (ValueError, TypeError):
+                mode = "pixels"
+        logger.info("OCR | coord mode: %s (image %dx%d)", mode, img_w, img_h)
         valid: list[dict[str, Any]] = []
 
         for idx, det in enumerate(detections):
@@ -249,6 +336,11 @@ class OCRService:
                     raise ValueError(f"bbox must have 4 values, got: {bbox_raw}")
 
                 x1, y1, x2, y2 = [float(v) for v in bbox_raw]
+
+                # Scale normalized 0-1000 → pixels BEFORE any other check
+                if mode == "normalized":
+                    x1, x2 = x1 * img_w / 1000.0, x2 * img_w / 1000.0
+                    y1, y2 = y1 * img_h / 1000.0, y2 * img_h / 1000.0
 
                 if x1 >= x2:
                     raise ValueError(f"x1 ({x1}) >= x2 ({x2})")
