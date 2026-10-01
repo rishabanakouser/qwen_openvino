@@ -34,6 +34,7 @@ def get_ocr_prompt(source_language: str, target_language: str) -> str:
         "5. Exact original text + natural translation (keep code/commands like "
         "'netstat -ano | findstr :8000' untranslated if a translation makes no sense). "
         "Do not summarize or describe the image. Do not omit small text. "
+        "Include sidebar navigation menus, headers, footers, and button labels — omit nothing."
         "Return ONLY a JSON array. No explanation. No markdown. "
         "Use this exact format:\n"
         '[{"text": "...", "translated_text": "...", "bbox": [x1, y1, x2, y2]}, ...]'
@@ -90,7 +91,7 @@ class OCRService:
         img_tensor = ov.Tensor(np.array(image))
 
         config = openvino_genai.GenerationConfig()
-        config.max_new_tokens = 2048
+        config.max_new_tokens = 3500
         config.do_sample = False
 
         prompt = get_ocr_prompt(source_language, target_language)
