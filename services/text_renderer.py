@@ -13,7 +13,6 @@ coordinates.  It:
 from __future__ import annotations
 
 import logging
-import textwrap
 from pathlib import Path
 from typing import Optional
 
@@ -57,9 +56,7 @@ class TextRenderer:
                 font_path,
             )
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Public API
-    # ─────────────────────────────────────────────────────────────────────────
     def render_text_in_bbox(
         self,
         image: Image.Image,
@@ -91,7 +88,6 @@ class TextRenderer:
 
         draw = ImageDraw.Draw(image)
 
-        # Extract font details (filled by FontStyleService; tolerate None)
         est_size = det.get("font_size") or 24
         try:
             est_size = int(est_size)
@@ -103,9 +99,8 @@ class TextRenderer:
         font_style = det.get("font_style") or "normal"
         font_family = det.get("font_family") or "sans-serif"
 
-        # 1. Auto-fit: allow 20% horizontal bleed for longer translations
-        # (e.g. EN->FR expands). Fit against expanded width, but draw
-        # centered on the ORIGINAL box so bleed is symmetric (~10% each side).
+        # Fit against expanded width (EN->FR grows ~20%), draw centered on
+        # the ORIGINAL box so bleed is symmetric (~10% each side).
         fit_w = max(8, int(box_w * 1.2))
         fit_h = max(8, box_h)
         font, lines = self._fit_text(
@@ -114,16 +109,13 @@ class TextRenderer:
             family=font_family, weight=font_weight, style=font_style,
         )
 
-        # Compute total text block height
         line_height = self._line_height(font)
         total_h = line_height * len(lines)
 
-        # Vertical start (centre block inside bbox)
         start_y = y1 + (box_h - total_h) // 2
 
         for i, line in enumerate(lines):
             line_w = self._text_width(font, line)
-            # Horizontal centre
             start_x = x1 + (box_w - line_w) // 2
             draw.text(
                 (start_x, start_y + i * line_height),
@@ -151,19 +143,16 @@ class TextRenderer:
                 )
         return image
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Internal helpers
-    # ─────────────────────────────────────────────────────────────────────────
     def _load_font(self, size: int, family: str = "", weight: str = "", style: str = "") -> ImageFont.FreeTypeFont:
         is_bold = "bold" in weight.lower()
         is_italic = "italic" in style.lower()
         
-        # Try common windows fonts
         font_name = "arial"
         if "times" in family.lower(): font_name = "times"
         elif "courier" in family.lower(): font_name = "cour"
         elif "segoe" in family.lower(): font_name = "segoeui"
-            
+
         suffix = ""
         if is_bold and is_italic:
             suffix = "bi" if font_name in ["arial", "times"] else "z"
@@ -194,7 +183,7 @@ class TextRenderer:
     @staticmethod
     def _text_width(font, text: str) -> int:
         try:
-            bbox = font.getbbox(text)  # Pillow ≥ 9.2
+            bbox = font.getbbox(text)
             return bbox[2] - bbox[0]
         except AttributeError:
             return font.getlength(text)  # type: ignore
@@ -217,13 +206,11 @@ class TextRenderer:
         if not words:
             return [text]
 
-        # Pre-split any single word wider than max_width
         split_words: list[str] = []
         for word in words:
             if self._text_width(font, word) <= max_width:
                 split_words.append(word)
                 continue
-            # Hard-break long token char by char
             chunk = ""
             for ch in word:
                 cand = chunk + ch
@@ -297,8 +284,7 @@ class TextRenderer:
             max_line_w = max(self._text_width(font, ln) for ln in lines)
 
             if max_line_w <= box_w and total_h <= box_h:
-                return font, lines  # largest fitting size found
-            # Remember smallest as fallback
+                return font, lines
             best_font, best_lines = font, lines
 
         return best_font, best_lines

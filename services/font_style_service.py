@@ -4,9 +4,9 @@ services/font_style_service.py
 Local, model-free font analysis to replace Qwen-predicted style fields.
 
 Why this exists:
-  - Asking Qwen2.5-VL for font_color / font_size / weight / background
+  - Asking Qwen for font_color / font_size / weight / background
     roughly doubles output tokens -> slower decode + laptop freeze.
-  - Qwen now returns only {text, translated_text, bbox}.
+  - Qwen returns only {text, translated_text, bbox}.
   - This service fills {font_color_rgb, background_color_rgb,
     font_size, font_weight, ...} with OpenCV + Pillow in ~ms per box.
 
@@ -63,14 +63,14 @@ class FontStyleService:
         self.font_size_max = font_size_max
         self.bold_density_threshold = bold_density_threshold
 
-    # ── Public API ────────────────────────────────────────────────
+    # Public API
     def enrich(
         self, image: Image.Image, detections: list[dict]
     ) -> list[dict]:
         """Fill missing style keys in-place; always returns same list."""
         if not detections:
             return detections
-        img_np = np.array(image.convert("RGB"))  # HxWx3, RGB
+        img_np = np.array(image.convert("RGB"))
         h, w = img_np.shape[:2]
         for det in detections:
             try:
@@ -83,7 +83,7 @@ class FontStyleService:
                 self._apply_defaults(det)
         return detections
 
-    # ── Per-box ───────────────────────────────────────────────────
+    # Per-box
     def _enrich_one(self, img_np: np.ndarray, img_w: int, img_h: int, det: dict) -> None:
         x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
         x1 = max(0, min(x1, img_w - 1))
@@ -94,10 +94,9 @@ class FontStyleService:
             self._apply_defaults(det)
             return
 
-        crop = img_np[y1:y2, x1:x2]  # RGB
+        crop = img_np[y1:y2, x1:x2]
         ch, cw = crop.shape[:2]
 
-        # 1. Background from border pixels (top/bottom rows + left/right cols)
         border = np.concatenate([
             crop[0:1, :, :].reshape(-1, 3),
             crop[-1:, :, :].reshape(-1, 3),
@@ -106,7 +105,6 @@ class FontStyleService:
         ], axis=0)
         bg_rgb = tuple(int(v) for v in np.median(border, axis=0))
 
-        # 2. Otsu split -> two clusters
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -147,13 +145,10 @@ class FontStyleService:
             # Blend median + core for stability
             font_rgb = tuple(int(round((m + c) / 2)) for m, c in zip(med, core))
 
-        # 3. Font size heuristic: box height ~= ascender+descender.
-        # Pillow truetype size roughly maps to that height.
         box_h = y2 - y1
         est_size = int(round(box_h * 0.8))
         est_size = max(self.font_size_min, min(self.font_size_max, est_size))
 
-        # 4. Weight heuristic: dense/stroke-heavy text -> bold.
         weight = "bold" if text_density > self.bold_density_threshold else "normal"
 
         # Only fill keys Qwen left empty (None) — never overwrite model values
@@ -167,7 +162,7 @@ class FontStyleService:
         det["font_style"] = det.get("font_style") or "normal"
         det["font_family"] = det.get("font_family") or "sans-serif"
 
-    # ── Helpers ───────────────────────────────────────────────────
+    # Helpers
     def _apply_defaults(self, det: dict) -> None:
         box_h = det["bbox"][3] - det["bbox"][1] if det.get("bbox") else 24
         det["font_color_rgb"] = det.get("font_color_rgb") or (0, 0, 0)

@@ -1,14 +1,10 @@
 """
 services/ocr_service.py
 
-Responsibilities:
-  - Accept a PIL image (or numpy array).
-  - Send it to the loaded Qwen2.5-VL-7B OpenVINO model.
-  - Parse the JSON response.
-  - Validate and clip every detected bounding-box.
-  - Return a list of validated OCR detections.
-
-The model instance is injected at startup (loaded once in main.py lifespan).
+OCR + translation via a Qwen-VL OpenVINO model (single pass). Parses the
+JSON response, scales normalized bboxes to pixels, validates every
+detection. The model instance is injected at startup (loaded once in
+main.py lifespan).
 """
 
 from __future__ import annotations
@@ -44,11 +40,9 @@ def get_ocr_prompt(source_language: str, target_language: str) -> str:
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # OCRService
-# ──────────────────────────────────────────────────────────────────────────────
 class OCRService:
-    """Wraps the Qwen2.5-VL OpenVINO model to perform OCR on images using openvino_genai."""
+    """Wraps a Qwen-VL OpenVINO model to perform OCR on images using openvino_genai."""
 
     def __init__(self, pipe):
         """
@@ -57,15 +51,13 @@ class OCRService:
         """
         self.pipe = pipe
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Public API
-    # ─────────────────────────────────────────────────────────────────────────
     def detect(self, image: Image.Image, source_language: str, target_language: str) -> list[dict[str, Any]]:
         """
         Run OCR and translation simultaneously on *image* and return validated detections.
 
         Returns:
-            List of dicts: {"text": str, "bbox": [x1, y1, x2, y2]}
+            List of dicts: {"text", "translated_text", "bbox": [x1, y1, x2, y2]}
             Coordinates are in original image pixel space (normalized model
             output is scaled here — see _validate_detections).
         """
@@ -78,12 +70,6 @@ class OCRService:
         raw_response = self._run_inference(image, source_language, target_language)
         t1 = time.perf_counter()
         logger.info("OCR | inference took %.2fs", t1 - t0)
-        
-        print("\n" + "-" * 50)
-        print("DEBUG: [OCR] Raw Model Output:")
-        print(raw_response)
-        print("-" * 50 + "\n")
-        
         logger.debug("OCR | raw model response: %s", raw_response)
 
         detections = self._parse_response(raw_response)
@@ -95,9 +81,7 @@ class OCRService:
         logger.info("OCR | %d valid detections", len(detections))
         return detections
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Inference
-    # ─────────────────────────────────────────────────────────────────────────
     def _run_inference(self, image: Image.Image, source_language: str, target_language: str) -> str:
         """Send image + prompt to the model and return the raw text output."""
         import openvino as ov
@@ -111,11 +95,6 @@ class OCRService:
 
         prompt = get_ocr_prompt(source_language, target_language)
 
-        print("\n" + "-" * 50)
-        print("DEBUG: [OCR+Translate] Generating text with prompt:")
-        print(prompt)
-        print("-" * 50 + "\n")
-
         res = self.pipe.generate(
             prompt,
             images=[img_tensor],
@@ -124,9 +103,7 @@ class OCRService:
 
         return res.texts[0].strip() if hasattr(res, "texts") and res.texts else str(res).strip()
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Parsing
-    # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
     def _try_json_list(s: str) -> list[dict[str, Any]] | None:
         """Return parsed list or None (never raises)."""
@@ -153,19 +130,16 @@ class OCRService:
 
         Every failure logs msg + position + snippet instead of swallowing it.
         """
-        # 1. Direct parse
         hit = OCRService._try_json_list(raw)
         if hit is not None:
             return hit
 
-        # 2. Strip markdown fences (```json ... ```) and retry
         stripped = re.sub(r"```(?:json)?", "", raw).strip().strip("`").strip()
         if stripped != raw:
             hit = OCRService._try_json_list(stripped)
             if hit is not None:
                 return hit
 
-        # 3. First '[' … last ']' slice
         start, end = raw.find("["), raw.rfind("]")
         block = raw[start:end + 1] if 0 <= start < end else ""
         if block and block != raw.strip():
@@ -178,16 +152,13 @@ class OCRService:
         else:
             logger.warning("OCR | no [...] block found; raw len=%d head=%.200r", len(raw), raw[:200])
 
-        # 4. Repairs on the block (or raw if no brackets)
         candidate = block or raw
-        # 4a. Trailing commas: {"a":1,} / [1,2,]
         repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
         if repaired != candidate:
             hit = OCRService._try_json_list(repaired)
             if hit is not None:
                 logger.info("OCR | recovered JSON after trailing-comma repair")
                 return hit
-        # 4b. Raw control chars (literal newlines/tabs inside strings)
         try:
             data = json.loads(candidate, strict=False)
             if isinstance(data, list):
@@ -197,7 +168,6 @@ class OCRService:
             logger.warning("OCR | strict=False also failed: %s at %d snippet=%.120r",
                            exc.msg, exc.pos, candidate[max(0, exc.pos - 60):exc.pos + 60])
 
-        # 5. Per-object fallback — salvage every parseable {...}
         salvaged: list[dict[str, Any]] = []
         for m in re.finditer(r"\{[^{}]*\}", candidate):
             obj_str = m.group()
@@ -226,9 +196,7 @@ class OCRService:
             logger.warning("OCR | response parsed but was not a list; head=%.200r", candidate[:200])
         return []
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Validation
-    # ─────────────────────────────────────────────────────────────────────────
     MIN_BOX_W = 8
     MIN_BOX_H = 8
     NMS_IOU_THRESHOLD = 0.3
@@ -256,7 +224,6 @@ class OCRService:
         NMS_IOU_THRESHOLD. Merged text is concatenated with a space so split
         words reassemble instead of double-drawing on top of each other.
         """
-        # 2. Filter tiny noise boxes (UI speckles, icons)
         kept = []
         for det in detections:
             x1, y1, x2, y2 = det["bbox"]
@@ -271,7 +238,6 @@ class OCRService:
             placed = False
             for m in merged:
                 if cls._iou(det["bbox"], m["bbox"]) > cls.NMS_IOU_THRESHOLD:
-                    # Union bbox
                     mx1, my1, mx2, my2 = m["bbox"]
                     x1, y1, x2, y2 = det["bbox"]
                     m["bbox"] = [min(mx1, x1), min(my1, y1), max(mx2, x2), max(my2, y2)]
@@ -337,7 +303,6 @@ class OCRService:
 
                 x1, y1, x2, y2 = [float(v) for v in bbox_raw]
 
-                # Scale normalized 0-1000 → pixels BEFORE any other check
                 if mode == "normalized":
                     x1, x2 = x1 * img_w / 1000.0, x2 * img_w / 1000.0
                     y1, y2 = y1 * img_h / 1000.0, y2 * img_h / 1000.0
@@ -347,7 +312,6 @@ class OCRService:
                 if y1 >= y2:
                     raise ValueError(f"y1 ({y1}) >= y2 ({y2})")
 
-                # Clip to image boundaries
                 x1 = max(0.0, min(x1, img_w - 1))
                 y1 = max(0.0, min(y1, img_h - 1))
                 x2 = max(0.0, min(x2, img_w))
@@ -360,12 +324,8 @@ class OCRService:
                 if not isinstance(translated_text, str):
                     translated_text = ""
 
-                # NOTE: font/background style is NO LONGER predicted by Qwen.
-                # It is filled in later by services/font_style_service.py
-                # (local OpenCV analysis, zero model cost). Keep keys present
-                # with None defaults so downstream code has a stable schema.
-                # Backward-compat: if an old model output still contains style
-                # fields, preserve them; otherwise leave None for enrichment.
+                # Style fields come from FontStyleService, not Qwen — None here
+                # means "fill in later"; preserved when already present.
                 def _get_rgb_optional(key):
                     val = det.get(key)
                     if isinstance(val, list) and len(val) == 3:

@@ -39,9 +39,7 @@ class InpaintService:
         # std the region is gradient/code-block/photo -> must use TELEA.
         self.flat_bg_std_threshold = flat_bg_std_threshold
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Public API
-    # ─────────────────────────────────────────────────────────────────────────
     def remove_text(
         self,
         image: Image.Image,
@@ -60,7 +58,7 @@ class InpaintService:
             logger.info("Inpaint | no detections, returning original image")
             return image
 
-        img_np = np.array(image.convert("RGB"))          # H×W×3 uint8
+        img_np = np.array(image.convert("RGB"))
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
         h, w = gray.shape
@@ -73,7 +71,6 @@ class InpaintService:
                 x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
                 bg_color = det.get("background_color_rgb")
 
-                # Clamp + padded region for variance test
                 px1, py1 = max(0, x1 - pad), max(0, y1 - pad)
                 px2, py2 = min(w, x2 + pad), min(h, y2 + pad)
                 if px2 <= px1 or py2 <= py1:
@@ -81,7 +78,6 @@ class InpaintService:
                 region_std = float(gray[py1:py2, px1:px2].std())
                 is_flat = region_std < self.flat_bg_std_threshold
 
-                # 3. Solid fill ONLY on flat + known color; else inpaint.
                 if bg_color and is_flat:
                     bgr = (int(bg_color[2]), int(bg_color[1]), int(bg_color[0]))
                     cv2.rectangle(img_bgr, (px1, py1), (px2, py2), bgr, -1)

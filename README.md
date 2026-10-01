@@ -1,11 +1,18 @@
-# Qwen2.5-VL OCR Translation Service
+# Qwen-VL OCR Translation Service
 
 A **backend-only** image OCR and translation API built with FastAPI and
-Qwen2.5-VL-7B-Instruct running on OpenVINO (INT8).
+Qwen-VL running on OpenVINO. Upload a screenshot → get back the same-size
+image with translated text rendered in place, plus JSON detections.
+
+Default model is **Qwen3-VL-4B-Instruct (INT4)**; Qwen2.5-VL-7B (INT8) is
+kept as a switchable backup. See `models/README.md`.
 
 ---
 
 ## Architecture
+
+Qwen does OCR **and** translation in a single pass. Font/color analysis is
+local OpenCV (no second model).
 
 ```
 POST /translate
@@ -14,17 +21,17 @@ POST /translate
    FastAPI (main.py)
        │
        ▼
-   OCRService          ← Qwen2.5-VL-7B INT8 via OpenVINO
-       │  [text, bbox] list
+   OCRService            ← Qwen-VL via OpenVINO (openvino_genai.VLMPipeline)
+       │  [{text, translated_text, bbox}]   (bboxes scaled to pixels)
        ▼
-   TranslationService  ← deep-translator / Google Translate
-       │  [text, translated_text, bbox] list
+   FontStyleService      ← OpenCV: font/background color, size, weight
+       │  enriched detections
        ▼
-   InpaintService      ← OpenCV INPAINT_TELEA
+   InpaintService        ← solid fill on flat bg, else TELEA inpaint
        │  clean image (original text erased)
        ▼
-   TextRenderer        ← Pillow + TrueType font
-       │  final image (translated text rendered)
+   TextRenderer          ← Pillow: auto-fit + wrap + centered TTF text
+       │  final image (same dimensions as input)
        ▼
    JSON response + GET /outputs/{filename}
 ```
@@ -41,23 +48,25 @@ qwen_openvino/
 ├── requirements.txt
 ├── .env                        # Active config (copy from .env.example)
 ├── .env.example                # Documented defaults
-├── download_model.py           # One-click model conversion script
-├── download_font.py            # One-click font download script
+├── download_model.py           # Qwen2.5-VL INT8 conversion script
+├── download_font.py            # DejaVuSans download script
 │
 ├── services/
 │   ├── __init__.py
-│   ├── ocr_service.py          # Qwen2.5-VL inference + JSON validation
-│   ├── translation_service.py  # Modular translation backend
-│   ├── inpaint_service.py      # OpenCV inpainting
-│   └── text_renderer.py        # Auto-fit TTF text rendering
+│   ├── ocr_service.py          # Qwen inference + robust JSON parsing + bbox validation
+│   ├── font_style_service.py   # Local font/color/size estimation (OpenCV)
+│   ├── inpaint_service.py      # Erase original text (fill or TELEA)
+│   └── text_renderer.py        # Auto-fit TTF rendering inside bboxes
 │
 ├── models/
-│   └── README.md               # Model download instructions
+│   ├── README.md               # Both models: download / convert / switch
+│   ├── Qwen3-VL-4B-Instruct-int4-ov/
+│   └── Qwen2.5-VL-7B-Instruct-int8-ov/
 │
 ├── fonts/
-│   └── README.md               # Font download instructions
+│   └── DejaVuSans.ttf          # Fallback render font (run download_font.py)
 │
-├── uploads/                    # Temporary uploaded images
+├── uploads/                    # Unused staging dir (kept for compatibility)
 └── outputs/                    # Generated translated images
 ```
 
@@ -67,90 +76,37 @@ qwen_openvino/
 
 | Component      | Requirement                              |
 |----------------|------------------------------------------|
-| Python         | 3.10 or 3.11                             |
-| RAM            | ≥ 16 GB (32 GB for model conversion)    |
+| Python         | 3.10 – 3.12                              |
+| RAM            | ≥ 16 GB (32 GB for INT8 model conversion)|
 | GPU (optional) | Intel Arc / Intel iGPU with OpenVINO GPU |
-| Disk           | ≥ 10 GB for the INT8 OV model            |
+| Disk           | ≥ 5 GB (INT4) / ≥ 10 GB (INT8)           |
 
 ---
 
 ## Installation
 
-### 1. Clone / navigate to the project
-
 ```bash
 cd qwen_openvino
-```
 
-### 2. Create a virtual environment
-
-```bash
 python -m venv .venv
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # Linux / macOS
 
-# Windows
-.venv\Scripts\activate
-
-# Linux / macOS
-source .venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
 pip install -r requirements.txt
+python download_font.py       # fonts/DejaVuSans.ttf
 ```
 
-### 4. Download the font
-
-```bash
-python download_font.py
-```
-
-### 5. Convert / download the model
-
-**Option A — automatic conversion from HuggingFace (recommended):**
-
-```bash
-python download_model.py
-```
-
-This downloads Qwen2.5-VL-7B-Instruct (~15 GB) and converts it to
-OpenVINO INT8 format (~8 GB).  One-time operation, takes 10–30 minutes.
-
-**Option B — manual optimum-cli:**
-
-```bash
-optimum-cli export openvino \
-    --model Qwen/Qwen2.5-VL-7B-Instruct \
-    --weight-format int8 \
-    ./models/Qwen2.5-VL-7B-Instruct-int8-ov
-```
-
-**Option C — HuggingFace Hub pre-converted:**
+Get a model (see `models/README.md` for all options):
 
 ```bash
 huggingface-cli download \
-    OpenVINO/Qwen2.5-VL-7B-Instruct-int8-ov \
-    --local-dir ./models/Qwen2.5-VL-7B-Instruct-int8-ov
+    OpenVINO/Qwen3-VL-4B-Instruct-int4-ov \
+    --local-dir ./models/Qwen3-VL-4B-Instruct-int4-ov
 ```
-
-### 6. Configure `.env`
 
 ```bash
-copy .env.example .env   # Windows
-cp .env.example .env     # Linux / macOS
-```
-
-Edit `.env` to match your setup:
-
-```env
-MODEL_PATH=./models/Qwen2.5-VL-7B-Instruct-int8-ov
-OPENVINO_DEVICE=GPU       # GPU | CPU | AUTO
-INPAINT_RADIUS=5
-BBOX_PADDING=2
-FONT_PATH=./fonts/DejaVuSans.ttf
-FONT_SIZE_MAX=40
-FONT_SIZE_MIN=6
+copy .env.example .env        # Windows
+# cp .env.example .env         # Linux / macOS
 ```
 
 ---
@@ -161,19 +117,13 @@ FONT_SIZE_MIN=6
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Startup output:
+Startup loads the VLM once (compilation takes minutes on first run).
 
-```
-============================================================
-Available OpenVINO devices:
-  CPU
-  GPU
-Selected device: GPU
-============================================================
-Loading model from: ./models/Qwen2.5-VL-7B-Instruct-int8-ov
-This may take a few minutes on first run (model compilation)...
-Model loaded successfully.
-============================================================
+Switch models via `.env` and restart:
+
+```env
+MODEL_PATH=./models/Qwen3-VL-4B-Instruct-int4-ov
+# MODEL_PATH=./models/Qwen2.5-VL-7B-Instruct-int8-ov
 ```
 
 ---
@@ -181,8 +131,6 @@ Model loaded successfully.
 ## API Reference
 
 ### `POST /translate`
-
-Translates all text in an uploaded image.
 
 **Request** (`multipart/form-data`):
 
@@ -201,69 +149,30 @@ Translates all text in an uploaded image.
   "target_language": "French",
   "detections": [
     {
-      "text": "Open",
-      "translated_text": "Ouvrir",
-      "bbox": [99, 88, 177, 154]
-    },
-    {
       "text": "Settings",
       "translated_text": "Paramètres",
-      "bbox": [300, 200, 450, 250]
+      "bbox": [42, 21, 74, 40]
     }
   ],
   "image_url": "/outputs/3f2a1b4c8e9d0f1a2b3c4d5e6f7a8b9c.png",
   "timing": {
-    "ocr_seconds": 4.21,
-    "translation_seconds": 0.85,
+    "ocr_seconds": 100.79,
+    "translation_seconds": 0.0,
     "inpaint_seconds": 0.03,
     "render_seconds": 0.01,
-    "total_seconds": 5.10
+    "total_seconds": 100.9
   }
 }
 ```
 
----
+> `translation_seconds` is `0.0` because translation is bundled into the
+> single Qwen pass. Output image pixels always equal input pixels.
 
-### `GET /outputs/{filename}`
+### `GET /outputs/{filename}` — translated image (PNG).
 
-Returns the generated translated image file.
+### `GET /health` — `{"status": "ok"|"loading", "model", "device"}`.
 
-```
-GET /outputs/3f2a1b4c8e9d0f1a2b3c4d5e6f7a8b9c.png
-```
-
----
-
-### `GET /health`
-
-```json
-{
-  "status": "ok",
-  "model": "Qwen2.5-VL-7B-Instruct",
-  "device": "GPU"
-}
-```
-
----
-
-### `GET /info`
-
-```json
-{
-  "model": "Qwen2.5-VL-7B-Instruct",
-  "model_path": "./models/Qwen2.5-VL-7B-Instruct-int8-ov",
-  "device": "GPU",
-  "openvino_version": "2024.3.0",
-  "available_devices": ["CPU", "GPU"],
-  "font_path": "./fonts/DejaVuSans.ttf",
-  "inpaint_radius": 5,
-  "bbox_padding": 2
-}
-```
-
----
-
-## Example Requests
+### `GET /info` — model path, device, OpenVINO version, font, inpaint settings.
 
 ### curl (Windows)
 
@@ -274,115 +183,44 @@ curl -X POST "http://localhost:8000/translate" ^
      -F "target_language=French"
 ```
 
-### curl (Linux / macOS)
-
-```bash
-curl -X POST "http://localhost:8000/translate" \
-     -F "image=@input.png" \
-     -F "source_language=English" \
-     -F "target_language=French"
-```
-
-### Python `requests`
-
-```python
-import requests
-
-files = {"image": open("input.png", "rb")}
-data  = {"source_language": "English", "target_language": "French"}
-
-response = requests.post(
-    "http://localhost:8000/translate",
-    files=files,
-    data=data,
-)
-result = response.json()
-print(result)
-
-# Download the translated image
-img_url = "http://localhost:8000" + result["image_url"]
-img_response = requests.get(img_url)
-with open("output.png", "wb") as f:
-    f.write(img_response.content)
-print("Saved output.png")
-```
-
----
-
-## GPU Usage Verification
-
-### Check at startup
-
-The service prints the selected device on startup:
-
-```
-Selected device: GPU
-```
-
-### Check via /info
-
-```bash
-curl http://localhost:8000/info
-```
-
-Look for `"device": "GPU"`.
-
-### Verify GPU is being used with Intel GPU tools
-
-```bash
-# Intel GPU activity monitor (Linux)
-intel_gpu_top
-
-# Or via OpenVINO benchmark tool
-benchmark_app -m ./models/.../openvino_language_model.xml -d GPU
-```
-
-### Fallback behaviour
-
-If `OPENVINO_DEVICE=GPU` is set but no GPU is available, OpenVINO will
-raise an error at model load time.  Set `OPENVINO_DEVICE=AUTO` to let
-OpenVINO automatically pick the best available device.
-
 ---
 
 ## Pipeline Details
 
-### 1 — OCR (OCRService)
+### 1 — OCR + Translation (OCRService, single Qwen pass)
 
-- The image is sent to Qwen2.5-VL with a carefully engineered prompt
-  that instructs the model to return **only** a JSON array of
-  `{"text", "bbox"}` objects.
-- If the model wraps the JSON in markdown fences or adds prose,
-  the parser strips them automatically via regex fallback.
-- Every detection is validated: non-empty text, exactly 4 numeric bbox
-  values, `x1 < x2`, `y1 < y2`, coordinates clipped to image bounds.
-- Invalid detections are skipped with a warning — they never crash the request.
+- The prompt asks for **normalized 0-1000 bboxes** (`0,0` top-left) because
+  Qwen's vision preprocessor resizes internally — raw "pixels" come back in
+  an unknown resized space. `OCR_COORD_MODE=auto` scales `0-1000 → pixels`
+  deterministically; legacy pixel responses pass through untouched.
+- Tiny boxes (`<8px`) are dropped; overlapping fragments (`IoU > 0.3`) are
+  merged into their union box with concatenated text; output is sorted in
+  reading order.
+- The JSON parser recovers from markdown fences, trailing prose, trailing
+  commas, control characters, and salvages valid `{...}` objects
+  individually — one corrupt entry never discards the rest. Parse failures
+  log `msg + char position + snippet`.
 
-### 2 — Translation (TranslationService)
+### 2 — Font/style (FontStyleService, no model, ms per box)
 
-- Receives `text`, `source_language`, `target_language` per detection.
-- The backend is **deep-translator** (Google Translate).
-- Language names ("English", "French") are mapped to ISO 639-1 codes
-  via an internal table covering 80+ languages.
-- To swap the translation engine, replace `_translate_backend()` in
-  `services/translation_service.py`.
+- Background = median of bbox border pixels; font color = Otsu text cluster
+  (median + dark/bright core so anti-aliasing doesn't wash it gray).
+- Size ≈ `box_h × 0.8` clamped to `FONT_SIZE_MIN/MAX`; bold if text-pixel
+  density > 0.35.
 
 ### 3 — Inpainting (InpaintService)
 
-- A binary mask is built from all OCR bboxes (optionally expanded by
-  `BBOX_PADDING` pixels).
-- `cv2.inpaint()` with `INPAINT_TELEA` reconstructs the background.
-- Unlike blurring, Telea inpainting propagates surrounding texture and
-  colour to fill the erased regions.
+- Flat background (gray std < 18) + known color → fast solid fill.
+- Otherwise (gradients, code blocks, dark UI) → TELEA inpaint with a
+  3px-dilated mask so glyph edges don't leave halos.
 
-### 4 — Text Rendering (TextRenderer)
+### 4 — Rendering (TextRenderer)
 
-- For each detection, the auto-fitter tries font sizes from `FONT_SIZE_MAX`
-  down to `FONT_SIZE_MIN`.
-- Text is word-wrapped to fit the box width.
-- The final text block is centred both horizontally and vertically inside
-  the original bbox.
-- If no TTF font is found, Pillow's built-in bitmap font is used.
+- Fits against `box_w × 1.2` (room for EN→FR expansion), starting from the
+  estimated size and shrinking until the wrapped block fits.
+- Long unbroken tokens (commands, URLs) are hard-split character-wise.
+- Text is centered in the original box using the system font
+  (`arial/bold/italic` on Windows) or `DejaVuSans.ttf` fallback.
 
 ---
 
@@ -390,40 +228,24 @@ OpenVINO automatically pick the best available device.
 
 | Variable          | Default                                         | Description                        |
 |-------------------|-------------------------------------------------|------------------------------------|
-| `MODEL_PATH`      | `./models/Qwen2.5-VL-7B-Instruct-int8-ov`      | Path to OV INT8 model directory    |
-| `OPENVINO_DEVICE` | `GPU`                                           | `GPU` / `CPU` / `AUTO`             |
+| `MODEL_PATH`      | `./models/Qwen3-VL-4B-Instruct-int4-ov`         | Active OV model directory          |
+| `OPENVINO_DEVICE` | `GPU`                                           | `GPU` / `CPU` / `AUTO` / `NPU`     |
+| `OCR_COORD_MODE`  | `auto`                                          | `auto` / `normalized` / `pixels`   |
 | `INPAINT_RADIUS`  | `5`                                             | OpenCV inpaint brush radius        |
 | `BBOX_PADDING`    | `2`                                             | Extra pixels around each bbox      |
-| `FONT_PATH`       | `./fonts/DejaVuSans.ttf`                        | TrueType font for rendering        |
+| `FONT_PATH`       | `./fonts/DejaVuSans.ttf`                        | Fallback TrueType font             |
 | `FONT_SIZE_MAX`   | `40`                                            | Largest font size tried            |
 | `FONT_SIZE_MIN`   | `6`                                             | Smallest font size before giving up|
 
----
-
-## Supported Languages
-
-The TranslationService maps language names to ISO codes for 80+ languages
-including: English, French, German, Spanish, Italian, Portuguese, Russian,
-Chinese (Simplified/Traditional), Japanese, Korean, Arabic, Hindi, and many more.
-
-See `services/translation_service.py` → `_LANGUAGE_MAP` for the full list.
+Set `OPENVINO_DEVICE=AUTO` if `GPU` fails at load time.
 
 ---
 
 ## Logging
 
-Every request produces structured log lines:
-
-```
-2026-09-25 18:00:01 | INFO     | main | Request received | source=English | target=French | file=input.png
-2026-09-25 18:00:01 | INFO     | main | Image dimensions: 1920x1080
-2026-09-25 18:00:06 | INFO     | services.ocr_service | OCR | 15 valid detections
-2026-09-25 18:00:06 | INFO     | main | OCR detections: 15 | time: 4.21s
-2026-09-25 18:00:07 | INFO     | main | Translation time: 0.85s
-2026-09-25 18:00:07 | INFO     | main | Inpainting time: 0.03s
-2026-09-25 18:00:07 | INFO     | main | Rendering time: 0.01s
-2026-09-25 18:00:07 | INFO     | main | SUMMARY | detections=15 | ocr=4.21s | translation=0.85s | inpaint=0.03s | render=0.01s | total=5.10s
-```
+Every request logs one line per stage (`main`, `services.ocr_service`).
+Raw model JSON is logged at `DEBUG` level only. No per-request `print()`
+noise — console output is the startup banner plus the `INFO` lines.
 
 ---
 
@@ -435,10 +257,8 @@ Every request produces structured log lines:
 | Invalid image format         | 422         | `"Cannot open image: ..."`            |
 | Missing source_language      | 422         | `"source_language is required"`       |
 | Missing target_language      | 422         | `"target_language is required"`       |
-| Model not found at startup   | 500 (crash) | Server won't start                    |
-| Device unavailable           | 500 (crash) | Server won't start                    |
-| OCR JSON parse failure       | 200 + `[]`  | Returns empty detections, not a crash |
-| Invalid bbox                 | 200 (skip)  | Bad bbox skipped, others processed    |
-| Translation failure          | 200 (orig)  | Returns original text, not a crash    |
+| Model not found at startup   | crash       | Fix `MODEL_PATH`, see `models/README` |
+| OCR JSON unparseable         | 200 + `[]`  | Partial salvage attempted first       |
+| Invalid bbox                 | 200 (skip)  | Bad box skipped, others processed     |
 | Output file not found        | 404         | Standard 404                          |
 | Services not initialised     | 503         | `"Services not initialised"`          |
