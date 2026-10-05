@@ -4,8 +4,11 @@ A **backend-only** image OCR and translation API built with FastAPI and
 Qwen-VL running on OpenVINO. Upload a screenshot → get back the same-size
 image with translated text rendered in place, plus JSON detections.
 
-Default model is **Qwen3-VL-4B-Instruct (INT4)**; Qwen2.5-VL-7B (INT8) is
-kept as a switchable backup. See `models/README.md`.
+Default backend is a **remote Ollama endpoint** (`qwen2.5-vl:7b` via an
+OpenAI-compatible API) — the image is PNG-encoded to base64 and posted to
+`/v1/chat/completions` with a maximum-completeness OCR prompt. A local
+OpenVINO model (Qwen3-VL-4B INT4, with Qwen2.5-VL-7B INT8 as backup) is
+switchable via `OCR_BACKEND=local`. See `models/README.md`.
 
 ---
 
@@ -21,7 +24,8 @@ POST /translate
    FastAPI (main.py)
        │
        ▼
-   OCRService            ← Qwen-VL via OpenVINO (openvino_genai.VLMPipeline)
+   OCRService            ← Qwen-VL, remote Ollama endpoint (default)
+                           or local OpenVINO (openvino_genai.VLMPipeline)
        │  [{text, translated_text, bbox}]   (bboxes scaled to pixels)
        ▼
    FontStyleService      ← OpenCV: font/background color, size, weight
@@ -228,8 +232,14 @@ curl -X POST "http://localhost:8000/translate" ^
 
 | Variable          | Default                                         | Description                        |
 |-------------------|-------------------------------------------------|------------------------------------|
-| `MODEL_PATH`      | `./models/Qwen3-VL-4B-Instruct-int4-ov`         | Active OV model directory          |
-| `OPENVINO_DEVICE` | `GPU`                                           | `GPU` / `CPU` / `AUTO` / `NPU`     |
+| `OCR_BACKEND`     | `remote`                                        | `remote` (Ollama endpoint) / `local` (OpenVINO) |
+| `OLLAMA_BASE_URL` | `http://34.63.203.19:11434/v1`                 | OpenAI-compatible endpoint         |
+| `OLLAMA_API_KEY`  | `EMPTY`                                         | Endpoint API key                   |
+| `OLLAMA_MODEL`    | `qwen2.5-vl:7b`                                 | Remote model id                    |
+| `OLLAMA_TIMEOUT`  | `300`                                           | Request timeout (seconds)          |
+| `OLLAMA_MAX_TOKENS` | `3500`                                        | Max output tokens per OCR request  |
+| `MODEL_PATH`      | `./models/Qwen3-VL-4B-Instruct-int4-ov`         | OV model dir (local backend only)  |
+| `OPENVINO_DEVICE` | `GPU`                                           | `GPU` / `CPU` / `AUTO` / `NPU` (local only) |
 | `OCR_COORD_MODE`  | `auto`                                          | `auto` / `normalized` / `pixels`   |
 | `INPAINT_RADIUS`  | `5`                                             | OpenCV inpaint brush radius        |
 | `BBOX_PADDING`    | `2`                                             | Extra pixels around each bbox      |
@@ -259,6 +269,9 @@ noise — console output is the startup banner plus the `INFO` lines.
 | Missing target_language      | 422         | `"target_language is required"`       |
 | Model not found at startup   | crash       | Fix `MODEL_PATH`, see `models/README` |
 | OCR JSON unparseable         | 200 + `[]`  | Partial salvage attempted first       |
+| No text regions detected     | 422         | Nothing to translate — input returned as error, never as output |
+| Nothing rendered (all skipped) | 500       | Per-region reasons in `detail` (empty-translation, degenerate-bbox, render-error) |
+| Output identical to input    | 500         | Safety net — inpaint/render left no visible change |
 | Invalid bbox                 | 200 (skip)  | Bad box skipped, others processed     |
 | Output file not found        | 404         | Standard 404                          |
 | Services not initialised     | 503         | `"Services not initialised"`          |

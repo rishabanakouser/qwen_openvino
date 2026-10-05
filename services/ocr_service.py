@@ -1,10 +1,12 @@
 """
 services/ocr_service.py
 
-OCR + translation via a Qwen-VL OpenVINO model (single pass). Parses the
-JSON response, scales normalized bboxes to pixels, validates every
-detection. The model instance is injected at startup (loaded once in
-main.py lifespan).
+OCR + translation via a Qwen-VL model (single pass). Two backends:
+  - remote: Ollama/OpenAI-compatible endpoint (OpenAI client + base64 image)
+  - local: OpenVINO VLMPipeline (ov.Tensor image)
+
+Parses the JSON response, scales normalized bboxes to pixels, validates
+every detection. The backend client is injected at startup (main.py lifespan).
 """
 
 from __future__ import annotations
@@ -22,35 +24,45 @@ logger = logging.getLogger(__name__)
 
 def get_ocr_prompt(source_language: str, target_language: str) -> str:
     return (
-        f"Detect every visible text region in the image (assuming it is mostly {source_language}) "
-        f"and translate the text into {target_language}. "
-        "Rules: "
-        "1. One entry per visual line or UI element — NEVER split a single line/word into fragments. "
-        "2. Merge fragments belonging to the same line into one entry. "
-        "3. Bounding box as NORMALIZED 0-1000 coordinates [x1, y1, x2, y2] "
-        "(0,0 = top-left, 1000,1000 = bottom-right), hugging the exact glyphs. "
+        f"Detect and extract EVERY visible text region in the image (assuming it is mostly {source_language}) "
+        "with maximum completeness. Do NOT omit, summarize, merge, or ignore ANY text, "
+        "regardless of size or position. Capture all text including large and small text, "
+        "headings, titles, labels, buttons, menus, navigation/sidebar text, captions, "
+        "tooltips, footnotes, numbers, symbols, text near the edges/corners, partially "
+        "visible text, and text inside UI elements. Each distinct visible text region "
+        "must be returned separately. Preserve the text exactly as it appears. "
+        f"Translate each detected text region into {target_language} "
+        "(keep code/commands like 'netstat -ano | findstr :8000' untranslated "
+        "if a translation makes no sense). "
+        "Return ONLY a valid JSON array, one object per text region in this exact format:\n"
+        '[{"text": "original text", "translated_text": "translation", "bbox": [x1, y1, x2, y2]}, ...]\n'
+        "The bbox must tightly enclose the corresponding text and use NORMALIZED "
+        "0-1000 coordinates (0,0 = top-left, 1000,1000 = bottom-right). "
         "Do NOT guess pixels — the image may be resized internally. "
-        "4. Reading order top-to-bottom, left-to-right. "
-        "5. Exact original text + natural translation (keep code/commands like "
-        "'netstat -ano | findstr :8000' untranslated if a translation makes no sense). "
-        "Do not summarize or describe the image. Do not omit small text. "
-        "Include sidebar navigation menus, headers, footers, and button labels — omit nothing."
-        "Return ONLY a JSON array. No explanation. No markdown. "
-        "Use this exact format:\n"
-        '[{"text": "...", "translated_text": "...", "bbox": [x1, y1, x2, y2]}, ...]'
+        "Every object MUST contain exactly these three keys in this order — "
+        "never omit \"text\", never repeat a key, always close arrays with ]. "
+        "Do not return Markdown, explanations, descriptions, or any text outside the JSON array."
     )
 
 
 # OCRService
 class OCRService:
-    """Wraps a Qwen-VL OpenVINO model to perform OCR on images using openvino_genai."""
+    """OCR + translation via Qwen-VL, over a remote endpoint or local OpenVINO."""
 
-    def __init__(self, pipe):
+    def __init__(self, pipe=None, client=None, model=None, max_tokens=None):
         """
         Args:
-            pipe: Loaded openvino_genai.VLMPipeline.
+            pipe: Loaded openvino_genai.VLMPipeline (local backend).
+            client: OpenAI client for the remote endpoint (remote backend).
+            model: Remote model id (defaults to config.OLLAMA_MODEL).
+            max_tokens: Remote max output tokens (defaults to config).
         """
+        import config as _config
+
         self.pipe = pipe
+        self.client = client
+        self.model = model or _config.OLLAMA_MODEL
+        self.max_tokens = max_tokens or _config.OLLAMA_MAX_TOKENS
 
     # Public API
     def detect(self, image: Image.Image, source_language: str, target_language: str) -> list[dict[str, Any]]:
@@ -85,6 +97,14 @@ class OCRService:
     # Inference
     def _run_inference(self, image: Image.Image, source_language: str, target_language: str) -> str:
         """Send image + prompt to the model and return the raw text output."""
+        if self.client is not None:
+            return self._run_remote(image, source_language, target_language)
+        if self.pipe is None:
+            raise RuntimeError("OCRService has neither a remote client nor a local pipe")
+        return self._run_local(image, source_language, target_language)
+
+    def _run_local(self, image: Image.Image, source_language: str, target_language: str) -> str:
+        """Local OpenVINO VLMPipeline path."""
         import openvino as ov
         import openvino_genai
 
@@ -103,6 +123,53 @@ class OCRService:
         )
 
         return res.texts[0].strip() if hasattr(res, "texts") and res.texts else str(res).strip()
+
+    @staticmethod
+    def _pil_to_data_url(image: Image.Image) -> str:
+        """Encode a PIL image as a base64 PNG data URL for the chat API."""
+        import base64
+        import io as _io
+
+        buf = _io.BytesIO()
+        image.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+
+    def _run_remote(self, image: Image.Image, source_language: str, target_language: str) -> str:
+        """Remote Ollama/OpenAI-compatible endpoint path (with one retry)."""
+        prompt = get_ocr_prompt(source_language, target_language)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": self._pil_to_data_url(image)},
+                    },
+                ],
+            }
+        ]
+
+        last_exc: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=self.max_tokens,
+                    temperature=0,
+                )
+                text = (resp.choices[0].message.content or "").strip()
+                if not text:
+                    raise ValueError("empty response content from remote model")
+                return text
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("OCR | remote attempt %d/2 failed: %s", attempt, exc)
+                if attempt == 1:
+                    time.sleep(2)
+        raise RuntimeError(f"remote inference failed: {last_exc}") from last_exc
 
     # Parsing
     @staticmethod
@@ -125,9 +192,11 @@ class OCRService:
           3. First '[' … last ']' slice (drops leading/trailing prose even
              when the prose itself contains brackets — the old greedy regex
              over-matched and died on exactly that).
-          4. Common repairs: trailing commas, raw control chars (strict=False).
+          4. Common repairs: trailing commas, unclosed arrays (`[...}` → `[...]`),
+             raw control chars (strict=False).
           5. Per-object fallback: parse each {...} individually so ONE corrupt
-             entry can't nuke 26 good detections (this incident).
+             entry can't nuke 26 good detections. Accepts entries missing
+             "text" when "translated_text" is present (filled in validation).
 
         Every failure logs msg + position + snippet instead of swallowing it.
         """
@@ -160,6 +229,12 @@ class OCRService:
             if hit is not None:
                 logger.info("OCR | recovered JSON after trailing-comma repair")
                 return hit
+        closed = re.sub(r"(\[[^\[\]]*)\}", r"\1]}", candidate)
+        if closed != candidate:
+            hit = OCRService._try_json_list(closed)
+            if hit is not None:
+                logger.info("OCR | recovered JSON after unclosed-array repair")
+                return hit
         try:
             data = json.loads(candidate, strict=False)
             if isinstance(data, list):
@@ -171,7 +246,7 @@ class OCRService:
 
         salvaged: list[dict[str, Any]] = []
         for m in re.finditer(r"\{[^{}]*\}", candidate):
-            obj_str = m.group()
+            obj_str = re.sub(r"(\[[^\[\]]*)\}", r"\1]}", m.group())
             obj = None
             try:
                 obj = json.loads(obj_str)
@@ -181,11 +256,11 @@ class OCRService:
                     obj = ast.literal_eval(obj_str)  # tolerates single quotes
                 except (ValueError, SyntaxError):
                     continue
-            if isinstance(obj, dict) and obj.get("text") and obj.get("bbox"):
+            if isinstance(obj, dict) and (obj.get("text") or obj.get("translated_text")) and obj.get("bbox"):
                 salvaged.append(obj)
         if salvaged:
-            logger.warning("OCR | salvaged %d/%d objects individually (full-array parse failed)",
-                           len(salvaged), candidate.count('"text"'))
+            logger.warning("OCR | salvaged %d objects individually (full-array parse failed)",
+                           len(salvaged))
             return salvaged
 
         try:
@@ -296,7 +371,12 @@ class OCRService:
             try:
                 text = det.get("text", "")
                 if not isinstance(text, str) or not text.strip():
-                    raise ValueError("empty or non-string text")
+                    fallback = det.get("translated_text", "")
+                    if isinstance(fallback, str) and fallback.strip():
+                        logger.warning("OCR | detection #%d missing text — rendering its translation anyway", idx)
+                        text = fallback
+                    else:
+                        raise ValueError("empty or non-string text")
 
                 bbox_raw = det.get("bbox")
                 if not isinstance(bbox_raw, (list, tuple)) or len(bbox_raw) != 4:

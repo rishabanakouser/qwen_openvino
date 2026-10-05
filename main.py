@@ -2,7 +2,7 @@
 main.py - FastAPI application for OCR + Translation using Qwen-VL on OpenVINO.
 
 Architecture:
-  startup  → load OpenVINO VLM once (Qwen3-VL-4B INT4 or Qwen2.5-VL-7B INT8)
+  startup  → remote Ollama endpoint (default) or local OpenVINO VLM
   POST /translate → OCRService → FontStyleService → InpaintService → TextRenderer
   GET  /outputs/{filename} → serve translated image
   GET  /health  → liveness check
@@ -21,7 +21,7 @@ from typing import Any
 import openvino as ov
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageOps
 import io
 
 import config
@@ -50,48 +50,75 @@ app_state: dict[str, Any] = {
 }
 
 
-# Lifespan: model loaded ONCE at startup, released at shutdown
+# Lifespan: backend client/pipe created ONCE at startup, released at shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    core = ov.Core()
-    available_devices = core.available_devices
-    app_state["available_devices"] = available_devices
+    if config.OCR_BACKEND == "remote":
+        print("\n" + "=" * 60)
+        print(f"OCR backend: remote ({config.OLLAMA_MODEL})")
+        print(f"Endpoint: {config.OLLAMA_BASE_URL}")
+        print("=" * 60)
 
-    print("\n" + "=" * 60)
-    print("Available OpenVINO devices:")
-    for d in available_devices:
-        print(f"  {d}")
-    print(f"Selected device: {config.OPENVINO_DEVICE}")
-    print("=" * 60)
+        try:
+            from openai import OpenAI
 
-    model_path = Path(config.MODEL_PATH)
-    if not model_path.exists():
-        logger.error(
-            "Model directory not found: %s\n"
-            "Run the model download script first. See models/README.md.",
-            model_path,
-        )
-        raise RuntimeError(f"Model not found at {model_path}")
+            client = OpenAI(
+                base_url=config.OLLAMA_BASE_URL,
+                api_key=config.OLLAMA_API_KEY,
+                timeout=config.OLLAMA_TIMEOUT,
+            )
+            client.models.list()
+            print("Remote endpoint reachable.")
+            print("=" * 60 + "\n")
 
-    print(f"Loading model from: {model_path}")
-    print("This may take a few minutes on first run (model compilation)...")
+        except Exception as exc:
+            logger.exception("Failed to reach remote endpoint: %s", exc)
+            raise RuntimeError(f"Remote endpoint unreachable: {exc}") from exc
 
-    try:
-        import openvino_genai
+        app_state["ocr_service"] = OCRService(client=client)
+        app_state["device"] = "remote"
+        app_state["available_devices"] = ["remote"]
+    else:
+        core = ov.Core()
+        available_devices = core.available_devices
+        app_state["available_devices"] = available_devices
 
-        pipe = openvino_genai.VLMPipeline(
-            str(model_path),
-            config.OPENVINO_DEVICE,
-        )
+        print("\n" + "=" * 60)
+        print("Available OpenVINO devices:")
+        for d in available_devices:
+            print(f"  {d}")
+        print(f"Selected device: {config.OPENVINO_DEVICE}")
+        print("=" * 60)
 
-        print("Model loaded successfully.")
-        print("=" * 60 + "\n")
+        model_path = Path(config.MODEL_PATH)
+        if not model_path.exists():
+            logger.error(
+                "Model directory not found: %s\n"
+                "Run the model download script first. See models/README.md.",
+                model_path,
+            )
+            raise RuntimeError(f"Model not found at {model_path}")
 
-    except Exception as exc:
-        logger.exception("Failed to load model: %s", exc)
-        raise RuntimeError(f"Model load failure: {exc}") from exc
+        print(f"Loading model from: {model_path}")
+        print("This may take a few minutes on first run (model compilation)...")
 
-    app_state["ocr_service"] = OCRService(pipe=pipe)
+        try:
+            import openvino_genai
+
+            pipe = openvino_genai.VLMPipeline(
+                str(model_path),
+                config.OPENVINO_DEVICE,
+            )
+
+            print("Model loaded successfully.")
+            print("=" * 60 + "\n")
+
+        except Exception as exc:
+            logger.exception("Failed to load model: %s", exc)
+            raise RuntimeError(f"Model load failure: {exc}") from exc
+
+        app_state["ocr_service"] = OCRService(pipe=pipe)
+
     app_state["font_style_service"] = FontStyleService()
     app_state["inpaint_service"] = InpaintService()
     app_state["text_renderer"] = TextRenderer()
@@ -164,8 +191,8 @@ async def translate(
 
     orig_w, orig_h = pil_image.size
     logger.info("Image dimensions: %dx%d", orig_w, orig_h)
-    logger.info("Source language: %s | Target language: %s | Device: %s",
-                source_language, target_language, config.OPENVINO_DEVICE)
+    logger.info("Source language: %s | Target language: %s | Backend: %s",
+                source_language, target_language, app_state["device"])
 
     ocr_start = time.perf_counter()
     try:
@@ -176,6 +203,14 @@ async def translate(
     ocr_time = time.perf_counter() - ocr_start
 
     logger.info("OCR+Translate detections: %d | time: %.2fs", len(detections), ocr_time)
+
+    if not detections:
+        raise HTTPException(
+            status_code=422,
+            detail="No text regions detected in the image — nothing to translate. "
+                   "The image may contain no readable text, or OCR failed to parse "
+                   "the model response (see server logs for OCR | warnings).",
+        )
 
     translation_time = 0.0  # bundled into the single Qwen pass, kept for timing schema
 
@@ -203,14 +238,24 @@ async def translate(
     render_start = time.perf_counter()
     try:
         renderer: TextRenderer = app_state["text_renderer"]
-        final_image = renderer.render_all(inpainted_image, detections)
+        final_image, rendered, skipped = renderer.render_all(inpainted_image, detections)
     except Exception as exc:
         logger.exception("Text rendering failed: %s", exc)
         raise HTTPException(
             status_code=500, detail=f"Render error: {exc}"
         ) from exc
     render_time = time.perf_counter() - render_start
-    logger.info("Rendering time: %.2fs", render_time)
+    logger.info("Rendering time: %.2fs | rendered=%d skipped=%d", render_time, rendered, len(skipped))
+
+    if rendered == 0:
+        reasons = "; ".join(
+            f"{reason} (text={text!r:.40})" for reason, text, _ in skipped
+        ) or "unknown"
+        raise HTTPException(
+            status_code=500,
+            detail=f"Translation rendering failed for all {len(detections)} regions — "
+                   f"nothing was drawn. Reasons: {reasons}. See server logs for details.",
+        )
 
     # Guard against any accidental resize so output pixels match input.
     if final_image.size != (orig_w, orig_h):
@@ -221,6 +266,16 @@ async def translate(
         final_image = final_image.resize((orig_w, orig_h), Image.LANCZOS)
     logger.info("Output dimensions: %dx%d (input was %dx%d)",
                 final_image.size[0], final_image.size[1], orig_w, orig_h)
+
+    # Fail loud: never return the input as the output. Inpaint + render always
+    # alter pixels when they run, so a byte-identical image means nothing happened.
+    if ImageChops.difference(final_image, pil_image).getbbox() is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Rendering produced no visible change — output is identical to "
+                   "the input. No translated text was drawn (see server logs for "
+                   "rendering/inpainting warnings).",
+        )
 
     output_filename = f"{uuid.uuid4().hex}.png"
     output_path = config.OUTPUTS_DIR / output_filename
@@ -236,9 +291,10 @@ async def translate(
     total_time = time.perf_counter() - total_start
 
     logger.info(
-        "SUMMARY | detections=%d | ocr=%.2fs | translation=%.2fs | "
+        "SUMMARY | detections=%d rendered=%d | ocr=%.2fs | translation=%.2fs | "
         "inpaint=%.2fs | render=%.2fs | total=%.2fs",
         len(detections),
+        rendered,
         ocr_time,
         translation_time,
         inpaint_time,
@@ -300,8 +356,9 @@ async def health():
     return JSONResponse(
         content={
             "status": "ok" if ready else "loading",
-            "model": config.MODEL_NAME,
-            "device": config.OPENVINO_DEVICE,
+            "ocr_backend": config.OCR_BACKEND,
+            "model": config.OLLAMA_MODEL if config.OCR_BACKEND == "remote" else config.MODEL_NAME,
+            "device": app_state["device"],
         },
         status_code=200 if ready else 503,
     )
@@ -311,15 +368,23 @@ async def health():
 @app.get("/info")
 async def info():
     """Detailed runtime information about the service."""
-    return JSONResponse(
-        content={
+    content = {
+        "ocr_backend": config.OCR_BACKEND,
+        "openvino_version": app_state["openvino_version"],
+        "available_devices": app_state["available_devices"],
+        "font_path": config.FONT_PATH,
+        "inpaint_radius": config.INPAINT_RADIUS,
+        "bbox_padding": config.BBOX_PADDING,
+    }
+    if config.OCR_BACKEND == "remote":
+        content.update({
+            "model": config.OLLAMA_MODEL,
+            "endpoint": config.OLLAMA_BASE_URL,
+        })
+    else:
+        content.update({
             "model": config.MODEL_NAME,
             "model_path": config.MODEL_PATH,
             "device": config.OPENVINO_DEVICE,
-            "openvino_version": app_state["openvino_version"],
-            "available_devices": app_state["available_devices"],
-            "font_path": config.FONT_PATH,
-            "inpaint_radius": config.INPAINT_RADIUS,
-            "bbox_padding": config.BBOX_PADDING,
-        }
-    )
+        })
+    return JSONResponse(content=content)

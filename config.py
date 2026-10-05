@@ -28,8 +28,18 @@ OUTPUTS_DIR: Path = BASE_DIR / "outputs"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# OpenVINO / Model
+# OpenVINO / Model (local backend only)
 OPENVINO_DEVICE: str = os.getenv("OPENVINO_DEVICE", "GPU")
+
+# OCR backend: "remote" (Ollama/OpenAI-compatible endpoint) or "local" (OpenVINO)
+OCR_BACKEND: str = os.getenv("OCR_BACKEND", "remote").lower()
+
+# Remote VLM endpoint (Ollama OpenAI-compatible API)
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://34.63.203.19:11434/v1")
+OLLAMA_API_KEY: str = os.getenv("OLLAMA_API_KEY", "EMPTY")
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5-vl:7b")
+OLLAMA_TIMEOUT: int = int(os.getenv("OLLAMA_TIMEOUT", "300"))
+OLLAMA_MAX_TOKENS: int = int(os.getenv("OLLAMA_MAX_TOKENS", "3500"))
 
 # Qwen bbox coordinate convention: "auto" | "normalized" | "pixels".
 # "auto" treats all-values-<=1000 responses as 0-1000 normalized and scales

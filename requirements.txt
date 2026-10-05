@@ -25,6 +25,9 @@ Pillow>=10.0.0
 opencv-python-headless>=4.9.0  # headless: no GUI dependencies needed on servers
 numpy>=1.24.0
 
+# Remote VLM endpoint (Ollama OpenAI-compatible API)
+openai>=1.40.0
+
 # Optional: GPU/NPU inference acceleration (install separately if needed)
 # openvino-gpu          # uncomment if GPU plugin is not bundled with openvino
 # nncf>=2.11.0          # uncomment for INT8 quantization (model conversion only)

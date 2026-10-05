@@ -130,18 +130,43 @@ class TextRenderer:
         self,
         image: Image.Image,
         detections: list[dict],
-    ) -> Image.Image:
+    ) -> tuple[Image.Image, int, list[tuple[str, str, object]]]:
         """
         Render translated text for every detection on the image.
+
+        Returns (image, rendered_count, skipped) where skipped holds
+        (reason, text, bbox) per dropped region so callers can fail loud
+        instead of silently returning the input image.
         """
+        rendered = 0
+        skipped: list[tuple[str, str, object]] = []
         for det in detections:
+            reason = self._skip_reason(det)
+            if reason is not None:
+                skipped.append((reason, det.get("text", ""), det.get("bbox")))
+                continue
             try:
                 image = self.render_text_in_bbox(image, det)
+                rendered += 1
             except Exception as exc:
                 logger.warning(
                     "TextRenderer | failed for det %s: %s", det, exc
                 )
-        return image
+                skipped.append((f"render-error: {exc}", det.get("text", ""), det.get("bbox")))
+        return image, rendered, skipped
+
+    @staticmethod
+    def _skip_reason(det: dict) -> str | None:
+        """Why render_text_in_bbox would no-op on *det*; None means it will draw."""
+        if not (det.get("translated_text") or "").strip():
+            return "empty-translation"
+        try:
+            x1, y1, x2, y2 = det["bbox"]
+        except (KeyError, TypeError, ValueError):
+            return "bad-bbox"
+        if x2 - x1 <= 0 or y2 - y1 <= 0:
+            return "degenerate-bbox"
+        return None
 
     # Internal helpers
     def _load_font(self, size: int, family: str = "", weight: str = "", style: str = "") -> ImageFont.FreeTypeFont:
