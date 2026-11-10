@@ -118,7 +118,7 @@ copy .env.example .env        # Windows
 ## Starting the service
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Startup loads the VLM once (compilation takes minutes on first run).

@@ -1,0 +1,1 @@
+python -m uvicorn test:app..to run the screen analyzer service 
